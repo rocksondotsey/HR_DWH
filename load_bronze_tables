@@ -1,0 +1,235 @@
+import sys
+import io
+from datetime import datetime
+import csv
+import pandas as pd
+from sqlalchemy import text, inspect
+from config.connection import fb_engine, pg_engine
+
+
+def get_primary_keys_for_table(schema_name, target_table):
+    """Retrieves primary key column names for a specific PostgreSQL table as a flat list of clean strings."""
+    query = text("""
+        SELECT a.attname
+        FROM   pg_index i
+        JOIN   pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE  i.indrelid = CAST(:table_fullname AS regclass)
+        AND    i.indisprimary;
+    """)
+    with pg_engine.connect() as conn:
+        result = conn.execute(
+            query, {"table_fullname": f"{schema_name}.{target_table}"}
+        )
+        return [row[0] for row in result.fetchall()]
+
+
+def load_all_bronze_data(table_list, schema_name="bronze", chunk_size=100000):
+    """
+    Streams large millions-row datasets from Firebird into a staging space,
+    then merges updates and inserts atomically into the final destination target table.
+    Uses multi-column incremental logic (reg_id & reg_regdttm) for the att_reg table.
+    """
+    print(
+        f"🚀 Starting High-Performance UPSERT (Merge) Sync into schema: '{schema_name}'..."
+    )
+    start_job_time = datetime.now()
+
+    pg_inspector = inspect(pg_engine)
+
+    for source_table in table_list:
+        source_table = source_table.strip().upper()
+        target_table = source_table.lower()
+        full_target_name = f"{schema_name}.{target_table}"
+        temp_table_name = f"temp_stage_{target_table}"
+
+        print(f"\n🔄 Checking Incremental Sync Status for: {full_target_name}")
+
+        # 1. Fetch benchmarks from PostgreSQL to capture variations
+        last_sync_time = None
+        max_id = None
+        try:
+            with pg_engine.connect() as pg_conn:
+                if source_table == "ATT_REG":
+                    # Get both maximum values for compound validation
+                    max_metrics_query = text(
+                        f"SELECT MAX(dw_ingested_at), MAX(reg_id) FROM {full_target_name}"
+                    )
+                    metrics_result = pg_conn.execute(max_metrics_query).fetchone()
+                    if metrics_result:
+                        last_sync_time = metrics_result[0]
+                        max_id = metrics_result[1]
+                else:
+                    max_time_query = text(
+                        f"SELECT MAX(dw_ingested_at) FROM {full_target_name}"
+                    )
+                    last_sync_time = pg_conn.execute(max_time_query).scalar()
+        except Exception:
+            pass
+
+        # 2. Dynamically build the SQL query for Firebird
+        if source_table == "ATT_REG" and last_sync_time and max_id is not None:
+            formatted_time = last_sync_time.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"   ⏳ Existing records found. Syncing via REG_ID > {max_id} OR REG_REGDTTM > '{formatted_time}'"
+            )
+            # Pulls any row that has a higher sequential ID OR a newer modification date
+            query = f'SELECT * FROM "{source_table}" WHERE "REG_ID" > {max_id} OR "REG_REGDTTM" > \'{formatted_time}\''
+        elif source_table != "ATT_REG" and last_sync_time:
+            # Fallback behavior for other tables with no tracking columns
+            print(
+                f"   ℹ️ No tracking column defined for {source_table}. Running in full refresh mode to preserve accuracy."
+            )
+            query = f'SELECT * FROM "{source_table}"'
+        else:
+            print(f"   📥 Table is empty. Running a baseline full load sync.")
+            query = f'SELECT * FROM "{source_table}"'
+
+        # Fetch target column data types from PostgreSQL to repair numeric formats
+        target_columns_info = pg_inspector.get_columns(target_table, schema=schema_name)
+        integer_cols = [
+            c["name"] for c in target_columns_info if "INT" in str(c["type"]).upper()
+        ]
+
+        try:
+            chunk_count = 0
+            total_rows = 0
+            pk_cols = get_primary_keys_for_table(schema_name, target_table)
+
+            raw_conn = pg_engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cursor:
+                    cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name};")
+                    cursor.execute(
+                        f"CREATE TEMP TABLE {temp_table_name} (LIKE {full_target_name} INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS;"
+                    )
+
+                    # Stream chunks from Firebird source
+                    for chunk in pd.read_sql(query, fb_engine, chunksize=chunk_size):
+                        chunk_count += 1
+                        row_count = len(chunk)
+                        total_rows += row_count
+
+                        chunk.columns = [col.lower() for col in chunk.columns]
+
+                        # 🛡️ Structural Data Cleaners
+                        for col in chunk.columns:
+                            if col in integer_cols:
+                                try:
+                                    chunk[col] = pd.to_numeric(
+                                        chunk[col], errors="coerce"
+                                    ).astype("Int64")
+                                except Exception:
+                                    pass
+                            elif chunk[col].dtype == "object":
+                                try:
+                                    chunk[col] = chunk[col].str.strip()
+                                    chunk[col] = chunk[col].str.replace(
+                                        r"\r\n|\r|\n", " ", regex=True
+                                    )
+                                except (AttributeError, TypeError):
+                                    pass
+
+                        chunk["dw_ingested_at"] = datetime.now()
+
+                        # In-Memory CSV Text Stream creation
+                        csv_buffer = io.StringIO()
+                        chunk.to_csv(
+                            csv_buffer,
+                            index=False,
+                            header=False,
+                            na_rep="",
+                            sep="\t",
+                            quoting=csv.QUOTE_MINIMAL,
+                            doublequote=True,
+                        )
+                        csv_buffer.seek(0)
+
+                        # Stream directly into temporary staging table via COPY
+                        columns_str = ", ".join([f'"{c}"' for c in chunk.columns])
+                        copy_query = f"COPY {temp_table_name} ({columns_str}) FROM STDIN WITH (FORMAT csv, DELIMITER '\t', NULL '', QUOTE '\"')"
+                        cursor.copy_expert(sql=copy_query, file=csv_buffer)
+                        print(
+                            f"   📥 Block {chunk_count}: Buffered and loaded {row_count} rows..."
+                        )
+
+                    # 3. Execute transactional merge operation if rows exist
+                    if total_rows > 0:
+                        if pk_cols:
+                            print(
+                                f"   ⚡ Merging changes into target table based on Primary Keys: {pk_cols}..."
+                            )
+
+                            join_condition = " AND ".join(
+                                [f"t.{pk} = s.{pk}" for pk in pk_cols]
+                            )
+                            non_pk_cols = [c for c in chunk.columns if c not in pk_cols]
+                            update_set = ", ".join(
+                                [f"{c} = s.{c}" for c in non_pk_cols]
+                            )
+                            insert_cols = ", ".join([f'"{c}"' for c in chunk.columns])
+                            values_str = ", ".join([f"s.{c}" for c in chunk.columns])
+
+                            merge_sql = f"""
+                                MERGE INTO {full_target_name} t
+                                USING {temp_table_name} s
+                                ON {join_condition}
+                                WHEN MATCHED THEN
+                                    UPDATE SET {update_set}
+                                WHEN NOT MATCHED THEN
+                                    INSERT ({insert_cols}) VALUES ({values_str});
+                            """
+                            cursor.execute(merge_sql)
+                            print(
+                                f"   ✅ Process complete. Synchronized {total_rows} modified/new rows."
+                            )
+                        else:
+                            print(
+                                f"   ⚠️ No primary key found for {target_table}. Overwriting table securely to avoid duplicates."
+                            )
+                            cursor.execute(
+                                f"TRUNCATE TABLE {full_target_name} RESTART IDENTITY;"
+                            )
+                            cursor.execute(
+                                f"INSERT INTO {full_target_name} SELECT * FROM {temp_table_name};"
+                            )
+                            print(f"   ✅ Refreshed {total_rows} rows.")
+                    else:
+                        print(
+                            f"   ⏭️ Up-to-date! Zero variations detected in Firebird."
+                        )
+
+                    cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name};")
+
+                raw_conn.commit()
+            except Exception as inner_e:
+                raw_conn.rollback()
+                raise inner_e
+            finally:
+                raw_conn.close()
+
+        except Exception as e:
+            print(f"❌ Ingestion routine broken for table {source_table}: {e}")
+
+    print(
+        f"\n🏁 Upsert sync complete. System Duration: {datetime.now() - start_job_time}"
+    )
+
+
+if __name__ == "__main__":
+    PRODUCTION_TABLES = [
+        "ATT_REG",
+        "ATT_TYP",
+        "EMP_EMP",
+        "WGR_AFD",
+        "ITA_ETY",
+        "ITA_GRD",
+        "ITA_NAT",
+        "ITA_CON",
+        "ITA_SLT",
+        "ITA_POS",
+        "WGR_BRA",
+        "ITA_RLG",
+    ]
+    load_all_bronze_data(
+        table_list=PRODUCTION_TABLES, schema_name="bronze", chunk_size=100000
+    )
