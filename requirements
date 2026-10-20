@@ -1,0 +1,11 @@
+sqlalchemy
+firebird-driver
+python-dotenv
+psycopg[binary]
+pandas
+pyarrow
+sqlalchemy-firebird 
+fdb
+psycopg2-binary
+dbt-core
+dbt-postgres
